@@ -38,7 +38,8 @@ services:
       - temporal
 
   worker:
-    image:  kalilinux/kali-rolling:latest
+    #image:  kalilinux/kali-rolling:latest
+    #image:  kalilinux/kali-rolling:latest
     build: .
     command: python worker.py
     environment:
