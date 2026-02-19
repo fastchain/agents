@@ -1,0 +1,81 @@
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      - POSTGRES_USER=temporal
+      - POSTGRES_PASSWORD=temporal
+      - POSTGRES_DB=temporal
+    volumes:
+      - ./temporal-postgres:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  temporal:
+    image: temporalio/auto-setup:latest
+    hostname: temporal
+    ports:
+      - "7233:7233"
+      - "8233:8233"
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=postgres
+      - DYNAMIC_CONFIG_FILE_PATH=/etc/temporal/config/dynamicconfig/development-sql.yaml
+    volumes:
+      - ./dynamicconfig/development-sql.yaml:/etc/temporal/config/dynamicconfig/development-sql.yaml:ro
+    depends_on:
+      - postgres
+    restart: on-failure
+
+  temporal-ui:
+    image: temporalio/ui:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+    depends_on:
+      - temporal
+
+  worker:
+    image:  kalilinux/kali-rolling:latest
+    build: .
+    command: python worker.py
+    environment:
+      - TEMPORAL_HOST=temporal:7233
+    cap_add:
+      - NET_RAW
+    depends_on:
+      - temporal
+    restart: on-failure
+
+  mcp-server:
+    build: .
+    command: python mcp_server.py
+    environment:
+      - TEMPORAL_HOST=temporal:7233
+    ports:
+      - "8000:8000"
+    depends_on:
+      - temporal
+    restart: on-failure
+    networks:
+      default: {}
+      shared_net:
+        aliases:
+          - mcp-nmap
+
+  # --- Optional: mcpo proxy for OpenWebUI SSE compatibility ---
+  # mcpo:
+  #   image: ghcr.io/nicholasgasior/mcpo:latest
+  #   command: --port 8001 -- python mcp_server.py --stdio
+  #   build: .
+  #   ports:
+  #     - "8001:8001"
+  #   depends_on:
+  #     - temporal
+
+
+networks:
+  shared_net:
+    external: true
