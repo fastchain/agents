@@ -1,0 +1,43 @@
+services:
+  litellm:
+    image: litellm/litellm:latest
+    container_name: litellm
+    env_file: .env
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    command: ["--config", "/app/config.yaml", "--host", "0.0.0.0", "--port", "4000"]
+    volumes:
+      - ./litellm_config.yaml:/app/config.yaml:ro
+    ports:
+      - "4000:4000"
+    restart: unless-stopped
+
+
+
+  agents-webui:
+    image: ghcr.io/open-webui/open-webui:latest
+    container_name: agents-webui
+    volumes:
+      - ./open-webui:/app/backend/data
+#    depends_on:
+#      - ollama-ipex
+    ports:
+      - 3000:8080
+    environment:
+      - WEBUI_AUTH=False
+#      - OLLAMA_BASE_URL=http://ollama-ipex:11435
+    #extra_hosts:
+    #  - host.docker.internal:host-gateway
+    restart: unless-stopped
+    networks:
+      default: { }
+      shared_net:
+        aliases:
+          - webui
+
+networks:
+  shared_net:
+    external: true
+#volumes:
+#  ollama-webui: {}
+#  ollama-intel-gpu: {}
