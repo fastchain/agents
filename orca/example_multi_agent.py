@@ -26,14 +26,15 @@ from pathlib import Path
 from rich.console import Console
 
 from bus import DurableBus
-from orchestrator import ResumableOrchestrator
-from specialist import SpecialistAgent
+from agents.orchestrator import ResumableOrchestrator
+from agents.specialist import SpecialistAgent
 
 console = Console()
 
 # Fixed session ID so we can resume the same session across runs
 SESSION_ID = "demo-session-001"
-DB_PATH = "demo_bus.db"
+IRC_HOST = "localhost"
+IRC_PORT = 6667
 
 
 def create_demo_manual():
@@ -94,7 +95,7 @@ def main():
     parser.add_argument("--resume", action="store_true", help="Resume a crashed session")
     args = parser.parse_args()
 
-    bus = DurableBus(DB_PATH)
+    bus = DurableBus(irc_host=IRC_HOST, irc_port=IRC_PORT)
     manual_path = create_demo_manual()
 
     # ── Show current bus state ─────────────────────────────────────────────
@@ -119,7 +120,7 @@ def main():
     specialist_thread = run_specialist_in_background(bus, manual_path)
 
     # ── Run or resume the session ──────────────────────────────────────────
-    task = "Summarize this sentence: 'The quick brown fox jumps over the lazy dog.' Then transform the result to JSON format."
+    task = "Transform this sentence: 'The quick brown fox jumps over the lazy dog.' Then transform the result to JSON format."
 
     console.print(f"\n[bold]Task:[/bold] {task}")
     console.print(f"[bold]Session:[/bold] {SESSION_ID}\n")
@@ -137,8 +138,8 @@ def main():
     for key in checkpoints:
         console.print(f"  [dim]•[/dim] {key}")
 
-    console.print(f"\n[green]Done. Database saved to: {DB_PATH}[/green]")
-    console.print(f"[dim]Run again — the orchestrator will see the session is already done and skip it.[/dim]")
+    console.print(f"\n[green]Done. IRC bus server: {IRC_HOST}:{IRC_PORT}[/green]")
+    console.print("[dim]Run again with same session_id to resume if checkpoints are still available in bus state.[/dim]")
 
 
 if __name__ == "__main__":

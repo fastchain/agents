@@ -1,78 +1,42 @@
 from __future__ import annotations
 
 """
-bus/core.py — Durable SQLite Message Bus
+IRC-backed bus.
 
-Every message and task is written to SQLite before being processed.
-This means:
-  - The bus can restart → all pending messages are still there
-  - Agents can restart  → they re-claim their incomplete tasks
-  - You can inspect the full history at any time
-  - No message is lost or processed twice (at-least-once delivery)
-
-## Core concepts
-
-  Task:
-    The unit of work. Created by the orchestrator, claimed by a specialist.
-    Has a status: pending → processing → done | failed
-
-  Checkpoint:
-    A named snapshot of an agent's progress.
-    Written by the agent periodically. On restart the agent reads its
-    last checkpoint and continues from there.
-
-  Message:
-    A one-way notification between agents (not request/reply).
-    Used for broadcasting events like "task X completed".
-
-## Durability model
-
-  SQLite with WAL mode:
-    - WAL (Write-Ahead Log) makes concurrent reads+writes safe
-    - Every write is fsync'd before the call returns
-    - If the process dies mid-write, SQLite recovers on next open
-
-  Task status machine:
-    pending ──► processing ──► done
-                    │
-                    └──────────► failed (after max_retries exceeded)
-                    │
-                    └──────────► pending (on agent crash — auto-requeued)
+Queues are IRC channels on a server (default localhost:6667). Task state and
+checkpoints are synchronized by broadcasting structured events over IRC.
 """
 
+import base64
 import json
-import uuid
-import time
-import sqlite3
+import socket
 import threading
-from pathlib import Path
+import time
+import uuid
+from dataclasses import dataclass
 from typing import Any
-from contextlib import contextmanager
-from dataclasses import dataclass, field
 
-
-# ── Data classes ───────────────────────────────────────────────────────────
 
 @dataclass
 class Task:
     id: str
-    queue: str             # which specialist should handle this
-    payload: dict          # the actual task data
-    status: str            # pending | processing | done | failed
+    queue: str
+    payload: dict
+    status: str
     created_at: float
     updated_at: float
-    claimed_by: str | None = None   # agent instance id
+    claimed_by: str | None = None
     result: dict | None = None
     error: str | None = None
     retries: int = 0
     max_retries: int = 3
-    parent_task_id: str | None = None  # for subtask trees
+    parent_task_id: str | None = None
 
 
 @dataclass
 class Checkpoint:
     agent_id: str
-    key: str               # e.g. "current_step", "processed_items"
+    key: str
     value: Any
     saved_at: float
 
@@ -86,105 +50,66 @@ class BusMessage:
     publisher: str
 
 
-# ── Bus ───────────────────────────────────────────────────────────────────
-
 class DurableBus:
     """
-    SQLite-backed message bus. Safe for multi-thread access within one process.
-    For multi-process, use PostgreSQL backend (see bus/pg_backend.py).
+    IRC-backed bus preserving the previous DurableBus API shape.
 
-    Usage:
-        bus = DurableBus("agent_state.db")
-
-        # Orchestrator creates a task
-        task_id = bus.publish_task("db_specialist", {"task": "write connection pool"})
-
-        # Specialist claims and processes it
-        task = bus.claim_task("db_specialist", agent_id="specialist-1")
-        result = do_work(task.payload)
-        bus.complete_task(task.id, result={"output": result})
-
-        # Orchestrator waits for result
-        result = bus.wait_for_result(task_id, timeout=60)
+    Notes:
+    - `db_path` is accepted for backwards compatibility but ignored.
+    - Queue names map to IRC channels.
+    - Uses event synchronization over IRC PRIVMSG.
     """
 
-    SCHEMA = """
-    CREATE TABLE IF NOT EXISTS tasks (
-        id              TEXT PRIMARY KEY,
-        queue           TEXT NOT NULL,
-        payload         TEXT NOT NULL,   -- JSON
-        status          TEXT NOT NULL DEFAULT 'pending',
-        created_at      REAL NOT NULL,
-        updated_at      REAL NOT NULL,
-        claimed_by      TEXT,
-        result          TEXT,            -- JSON
-        error           TEXT,
-        retries         INTEGER NOT NULL DEFAULT 0,
-        max_retries     INTEGER NOT NULL DEFAULT 3,
-        parent_task_id  TEXT
-    );
+    STALE_TASK_TIMEOUT = 120
+    CONTROL_CHANNEL = "#bus_control"
+    CHECKPOINT_CHANNEL = "#bus_checkpoints"
+    MESSAGE_CHANNEL = "#bus_messages"
 
-    CREATE INDEX IF NOT EXISTS idx_tasks_queue_status ON tasks(queue, status);
-    CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id);
+    def __init__(
+        self,
+        db_path: str | None = None,
+        *,
+        irc_host: str = "localhost",
+        irc_port: int = 6667,
+        nickname: str | None = None,
+    ):
+        _ = db_path
+        self.irc_host = irc_host
+        self.irc_port = irc_port
+        self.nickname = nickname or f"bus_{uuid.uuid4().hex[:8]}"
 
-    CREATE TABLE IF NOT EXISTS checkpoints (
-        agent_id    TEXT NOT NULL,
-        key         TEXT NOT NULL,
-        value       TEXT NOT NULL,   -- JSON
-        saved_at    REAL NOT NULL,
-        PRIMARY KEY (agent_id, key)
-    );
+        self._tasks: dict[str, Task] = {}
+        self._checkpoints: dict[tuple[str, str], Checkpoint] = {}
+        self._messages: list[BusMessage] = []
+        self._joined_channels: set[str] = set()
+        self._chunk_buffer: dict[str, dict[int, str]] = {}
+        self._chunk_expected: dict[str, int] = {}
 
-    CREATE TABLE IF NOT EXISTS messages (
-        id           TEXT PRIMARY KEY,
-        topic        TEXT NOT NULL,
-        payload      TEXT NOT NULL,  -- JSON
-        published_at REAL NOT NULL,
-        publisher    TEXT NOT NULL
-    );
+        self._lock = threading.RLock()
+        self._send_lock = threading.Lock()
+        self._ready = threading.Event()
+        self._stop = threading.Event()
 
-    CREATE INDEX IF NOT EXISTS idx_messages_topic ON messages(topic);
-    """
+        self._sock = socket.create_connection((self.irc_host, self.irc_port), timeout=10)
+        self._sock.settimeout(0.5)
+        self._recv_buffer = b""
 
-    # If a task stays in 'processing' for longer than this,
-    # assume the agent crashed and requeue it.
-    STALE_TASK_TIMEOUT = 120   # seconds
+        self._send_raw(f"NICK {self.nickname}")
+        self._send_raw(f"USER {self.nickname} 0 * :{self.nickname}")
 
-    def __init__(self, db_path: str | Path = "agent_bus.db"):
-        self.db_path = str(db_path)
-        self._local = threading.local()   # thread-local connections
-        self._init_db()
+        self._reader = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader.start()
 
-    # ── Connection management ──────────────────────────────────────────────
+        # Give connection a short window to register and start reading.
+        self._ready.wait(timeout=2.0)
 
-    @property
-    def _conn(self) -> sqlite3.Connection:
-        """Thread-local SQLite connection (SQLite connections aren't thread-safe)."""
-        if not hasattr(self._local, "conn") or self._local.conn is None:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")   # concurrent reads + writes
-            conn.execute("PRAGMA synchronous=NORMAL") # safe + fast
-            conn.execute("PRAGMA foreign_keys=ON")
-            self._local.conn = conn
-        return self._local.conn
+        self._ensure_channel(self.CONTROL_CHANNEL)
+        self._ensure_channel(self.CHECKPOINT_CHANNEL)
+        self._ensure_channel(self.MESSAGE_CHANNEL)
 
-    @contextmanager
-    def _tx(self):
-        """Context manager for a committed transaction."""
-        conn = self._conn
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-
-    def _init_db(self):
-        with self._tx() as conn:
-            conn.executescript(self.SCHEMA)
-
-    # ── Task API ───────────────────────────────────────────────────────────
+    # ---------------------------------------------------------------------
+    # Public API
+    # ---------------------------------------------------------------------
 
     def publish_task(
         self,
@@ -195,101 +120,92 @@ class DurableBus:
         max_retries: int = 3,
         parent_task_id: str | None = None,
     ) -> str:
-        """
-        Create a new task on a queue.
-        Returns the task_id. The task is immediately durable.
-        """
         tid = task_id or str(uuid.uuid4())
         now = time.time()
-        with self._tx() as conn:
-            conn.execute(
-                """
-                INSERT INTO tasks (id, queue, payload, status, created_at, updated_at,
-                                   max_retries, parent_task_id)
-                VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)
-                """,
-                (tid, queue, json.dumps(payload), now, now, max_retries, parent_task_id),
-            )
+        event = {
+            "type": "task_create",
+            "task": {
+                "id": tid,
+                "queue": queue,
+                "payload": payload,
+                "status": "pending",
+                "created_at": now,
+                "updated_at": now,
+                "claimed_by": None,
+                "result": None,
+                "error": None,
+                "retries": 0,
+                "max_retries": max_retries,
+                "parent_task_id": parent_task_id,
+            },
+        }
+        self._send_event(self._queue_channel(queue), event)
+        self._wait_until(lambda: tid in self._tasks, timeout=2.0)
         return tid
 
     def claim_task(self, queue: str, agent_id: str) -> Task | None:
-        """
-        Atomically claim the next pending task on a queue.
-        Also requeues stale tasks (agent crashed while processing).
-        Returns None if no tasks are available.
-        """
+        self._ensure_channel(self._queue_channel(queue))
         self._requeue_stale_tasks(queue)
 
-        with self._tx() as conn:
-            row = conn.execute(
-                """
-                SELECT * FROM tasks
-                WHERE queue = ? AND status = 'pending'
-                ORDER BY created_at ASC
-                LIMIT 1
-                """,
-                (queue,),
-            ).fetchone()
+        with self._lock:
+            candidates = [
+                t for t in self._tasks.values() if t.queue == queue and t.status == "pending"
+            ]
+            candidates.sort(key=lambda t: (t.created_at, t.id))
 
-            if not row:
-                return None
+        for task in candidates:
+            event = {
+                "type": "task_claim",
+                "task_id": task.id,
+                "agent_id": agent_id,
+                "updated_at": time.time(),
+            }
+            self._send_event(self._queue_channel(queue), event)
 
-            now = time.time()
-            conn.execute(
-                """
-                UPDATE tasks SET status='processing', claimed_by=?, updated_at=?
-                WHERE id=? AND status='pending'
-                """,
-                (agent_id, now, row["id"]),
+            self._wait_until(
+                lambda: self._is_claimed_by(task.id, agent_id) or self._is_not_pending(task.id),
+                timeout=1.0,
             )
 
-        return self._row_to_task(row)
+            claimed = self.get_task(task.id)
+            if claimed and claimed.status == "processing" and claimed.claimed_by == agent_id:
+                return claimed
+
+        return None
 
     def complete_task(self, task_id: str, result: dict) -> None:
-        """Mark a task as done with its result."""
-        with self._tx() as conn:
-            conn.execute(
-                "UPDATE tasks SET status='done', result=?, updated_at=? WHERE id=?",
-                (json.dumps(result), time.time(), task_id),
-            )
+        task = self.get_task(task_id)
+        if not task:
+            return
+        event = {
+            "type": "task_complete",
+            "task_id": task_id,
+            "result": result,
+            "updated_at": time.time(),
+        }
+        self._send_event(self._queue_channel(task.queue), event)
+        self._wait_until(lambda: self._task_status(task_id) == "done", timeout=2.0)
 
     def fail_task(self, task_id: str, error: str) -> None:
-        """
-        Mark a task step as failed.
-        If retries remain, requeues it as 'pending'. Otherwise marks 'failed'.
-        """
-        with self._tx() as conn:
-            row = conn.execute(
-                "SELECT retries, max_retries FROM tasks WHERE id=?", (task_id,)
-            ).fetchone()
-
-            if not row:
-                return
-
-            retries = row["retries"] + 1
-            if retries <= row["max_retries"]:
-                conn.execute(
-                    """UPDATE tasks SET status='pending', retries=?, error=?, updated_at=?,
-                       claimed_by=NULL WHERE id=?""",
-                    (retries, error, time.time(), task_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE tasks SET status='failed', error=?, updated_at=? WHERE id=?",
-                    (error, time.time(), task_id),
-                )
+        task = self.get_task(task_id)
+        if not task:
+            return
+        event = {
+            "type": "task_fail",
+            "task_id": task_id,
+            "error": error,
+            "updated_at": time.time(),
+        }
+        self._send_event(self._queue_channel(task.queue), event)
 
     def get_task(self, task_id: str) -> Task | None:
-        row = self._conn.execute(
-            "SELECT * FROM tasks WHERE id=?", (task_id,)
-        ).fetchone()
-        return self._row_to_task(row) if row else None
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if not task:
+                return None
+            return Task(**task.__dict__)
 
     def wait_for_result(self, task_id: str, timeout: float = 120, poll: float = 0.5) -> dict | None:
-        """
-        Block until a task is done or failed (or timeout).
-        Returns the result dict, or raises on failure/timeout.
-        """
         deadline = time.time() + timeout
         while time.time() < deadline:
             task = self.get_task(task_id)
@@ -303,148 +219,293 @@ class DurableBus:
         raise TimeoutError(f"Task {task_id} did not complete within {timeout}s")
 
     def pending_count(self, queue: str) -> int:
-        row = self._conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE queue=? AND status='pending'", (queue,)
-        ).fetchone()
-        return row[0]
-
-    # ── Checkpoint API ─────────────────────────────────────────────────────
+        with self._lock:
+            return sum(1 for t in self._tasks.values() if t.queue == queue and t.status == "pending")
 
     def save_checkpoint(self, agent_id: str, key: str, value: Any) -> None:
-        """
-        Save a named checkpoint for an agent.
-        Overwrites any previous value for the same (agent_id, key).
-
-        Use this to record progress so agents can resume after restart:
-            bus.save_checkpoint("orchestrator", "current_step", "waiting_for_db")
-            bus.save_checkpoint("orchestrator", "processed_files", ["a.py", "b.py"])
-        """
-        with self._tx() as conn:
-            conn.execute(
-                """
-                INSERT INTO checkpoints (agent_id, key, value, saved_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(agent_id, key) DO UPDATE SET value=excluded.value, saved_at=excluded.saved_at
-                """,
-                (agent_id, key, json.dumps(value), time.time()),
-            )
+        event = {
+            "type": "checkpoint_set",
+            "agent_id": agent_id,
+            "key": key,
+            "value": value,
+            "saved_at": time.time(),
+        }
+        self._send_event(self.CHECKPOINT_CHANNEL, event)
+        self._wait_until(lambda: (agent_id, key) in self._checkpoints, timeout=2.0)
 
     def load_checkpoint(self, agent_id: str, key: str, default: Any = None) -> Any:
-        """
-        Load a saved checkpoint. Returns `default` if not found.
-
-        Use this at agent startup to resume:
-            step = bus.load_checkpoint("orchestrator", "current_step")
-            if step:
-                print(f"Resuming from step: {step}")
-        """
-        row = self._conn.execute(
-            "SELECT value FROM checkpoints WHERE agent_id=? AND key=?",
-            (agent_id, key),
-        ).fetchone()
-        if row is None:
-            return default
-        return json.loads(row["value"])
+        with self._lock:
+            cp = self._checkpoints.get((agent_id, key))
+            return cp.value if cp else default
 
     def load_all_checkpoints(self, agent_id: str) -> dict:
-        """Load all checkpoints for an agent as a dict."""
-        rows = self._conn.execute(
-            "SELECT key, value FROM checkpoints WHERE agent_id=?", (agent_id,)
-        ).fetchall()
-        return {row["key"]: json.loads(row["value"]) for row in rows}
+        with self._lock:
+            return {cp.key: cp.value for cp in self._checkpoints.values() if cp.agent_id == agent_id}
 
     def clear_checkpoints(self, agent_id: str) -> None:
-        """Clear all checkpoints for an agent (e.g. after a clean completion)."""
-        with self._tx() as conn:
-            conn.execute("DELETE FROM checkpoints WHERE agent_id=?", (agent_id,))
-
-    # ── Message (pub/sub events) API ───────────────────────────────────────
+        # Best-effort local clear. Propagating deletes would need a dedicated event.
+        with self._lock:
+            keys = [k for k in self._checkpoints if k[0] == agent_id]
+            for key in keys:
+                del self._checkpoints[key]
 
     def publish_message(self, topic: str, payload: dict, publisher: str) -> str:
-        """Publish a one-way event message to a topic."""
         mid = str(uuid.uuid4())
-        with self._tx() as conn:
-            conn.execute(
-                "INSERT INTO messages (id, topic, payload, published_at, publisher) VALUES (?,?,?,?,?)",
-                (mid, topic, json.dumps(payload), time.time(), publisher),
-            )
+        event = {
+            "type": "message_publish",
+            "id": mid,
+            "topic": topic,
+            "payload": payload,
+            "published_at": time.time(),
+            "publisher": publisher,
+        }
+        self._send_event(self.MESSAGE_CHANNEL, event)
         return mid
 
     def get_messages(self, topic: str, since: float = 0.0) -> list[BusMessage]:
-        """Read all messages on a topic since a given timestamp."""
-        rows = self._conn.execute(
-            "SELECT * FROM messages WHERE topic=? AND published_at > ? ORDER BY published_at ASC",
-            (topic, since),
-        ).fetchall()
-        return [
-            BusMessage(
-                id=r["id"],
-                topic=r["topic"],
-                payload=json.loads(r["payload"]),
-                published_at=r["published_at"],
-                publisher=r["publisher"],
-            )
-            for r in rows
-        ]
-
-    # ── Status / inspection ────────────────────────────────────────────────
+        with self._lock:
+            return [m for m in self._messages if m.topic == topic and m.published_at > since]
 
     def status_report(self) -> dict:
-        """Overview of all queues and task statuses. Useful for debugging."""
-        rows = self._conn.execute(
-            """
-            SELECT queue, status, COUNT(*) as count
-            FROM tasks
-            GROUP BY queue, status
-            ORDER BY queue, status
-            """
-        ).fetchall()
-        report = {}
-        for row in rows:
-            q = row["queue"]
-            if q not in report:
-                report[q] = {}
-            report[q][row["status"]] = row["count"]
+        report: dict[str, dict[str, int]] = {}
+        with self._lock:
+            for task in self._tasks.values():
+                queue_stats = report.setdefault(task.queue, {})
+                queue_stats[task.status] = queue_stats.get(task.status, 0) + 1
         return report
 
     def get_task_tree(self, parent_task_id: str) -> list[Task]:
-        """Get all subtasks of a parent task."""
-        rows = self._conn.execute(
-            "SELECT * FROM tasks WHERE parent_task_id=? ORDER BY created_at",
-            (parent_task_id,),
-        ).fetchall()
-        return [self._row_to_task(r) for r in rows]
+        with self._lock:
+            return [Task(**t.__dict__) for t in self._tasks.values() if t.parent_task_id == parent_task_id]
 
-    # ── Internal helpers ───────────────────────────────────────────────────
+    def list_tasks(
+        self,
+        *,
+        queue: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[Task]:
+        with self._lock:
+            tasks = list(self._tasks.values())
+        if queue is not None:
+            tasks = [t for t in tasks if t.queue == queue]
+        if status is not None:
+            tasks = [t for t in tasks if t.status == status]
+        tasks.sort(key=lambda t: t.created_at, reverse=True)
+        return [Task(**t.__dict__) for t in tasks[:limit]]
+
+    def list_checkpoints(self, agent_id: str | None = None) -> list[Checkpoint]:
+        with self._lock:
+            cps = list(self._checkpoints.values())
+        if agent_id is not None:
+            cps = [cp for cp in cps if cp.agent_id == agent_id]
+        cps.sort(key=lambda cp: cp.saved_at, reverse=True)
+        return [Checkpoint(**cp.__dict__) for cp in cps]
+
+    # ---------------------------------------------------------------------
+    # Internal helpers
+    # ---------------------------------------------------------------------
+
+    def _queue_channel(self, queue: str) -> str:
+        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in queue)
+        if not safe:
+            safe = "default"
+        channel = f"#q_{safe}"
+        self._ensure_channel(channel)
+        return channel
+
+    def _ensure_channel(self, channel: str) -> None:
+        with self._lock:
+            if channel in self._joined_channels:
+                return
+            self._joined_channels.add(channel)
+        self._send_raw(f"JOIN {channel}")
+
+    def _send_event(self, channel: str, event: dict) -> None:
+        self._ensure_channel(channel)
+        payload = json.dumps(event, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        b64 = base64.urlsafe_b64encode(payload).decode("ascii")
+
+        # Keep margin under IRC line length limits.
+        chunk_size = 300
+        if len(b64) <= chunk_size:
+            self._send_raw(f"PRIVMSG {channel} :BUS1 {b64}")
+            return
+
+        msg_id = uuid.uuid4().hex[:10]
+        total = (len(b64) + chunk_size - 1) // chunk_size
+        for idx in range(total):
+            start = idx * chunk_size
+            end = start + chunk_size
+            piece = b64[start:end]
+            self._send_raw(f"PRIVMSG {channel} :BUSC {msg_id} {idx + 1}/{total} {piece}")
+
+    def _send_raw(self, line: str) -> None:
+        data = (line + "\r\n").encode("utf-8", errors="ignore")
+        with self._send_lock:
+            self._sock.sendall(data)
+
+    def _reader_loop(self) -> None:
+        self._ready.set()
+        while not self._stop.is_set():
+            try:
+                chunk = self._sock.recv(4096)
+                if not chunk:
+                    time.sleep(0.1)
+                    continue
+                self._recv_buffer += chunk
+
+                while b"\r\n" in self._recv_buffer:
+                    line, self._recv_buffer = self._recv_buffer.split(b"\r\n", 1)
+                    self._handle_line(line.decode("utf-8", errors="ignore"))
+            except socket.timeout:
+                continue
+            except Exception:
+                time.sleep(0.1)
+
+    def _handle_line(self, line: str) -> None:
+        if line.startswith("PING"):
+            token = line.split(":", 1)[1] if ":" in line else ""
+            self._send_raw(f"PONG :{token}")
+            return
+
+        if " PRIVMSG " not in line:
+            return
+
+        try:
+            prefix, rest = line.split(" PRIVMSG ", 1)
+            channel, text = rest.split(" :", 1)
+        except ValueError:
+            return
+
+        if text.startswith("BUS1 "):
+            b64 = text[5:].strip()
+            self._apply_b64_event(b64)
+            return
+
+        if text.startswith("BUSC "):
+            parts = text.split(" ", 3)
+            if len(parts) != 4:
+                return
+            _, msg_id, seq, piece = parts
+            if "/" not in seq:
+                return
+            idx_str, total_str = seq.split("/", 1)
+            try:
+                idx = int(idx_str)
+                total = int(total_str)
+            except ValueError:
+                return
+
+            with self._lock:
+                if msg_id not in self._chunk_buffer:
+                    self._chunk_buffer[msg_id] = {}
+                    self._chunk_expected[msg_id] = total
+                self._chunk_buffer[msg_id][idx] = piece
+
+                if len(self._chunk_buffer[msg_id]) == self._chunk_expected[msg_id]:
+                    ordered = "".join(self._chunk_buffer[msg_id][i] for i in range(1, total + 1))
+                    del self._chunk_buffer[msg_id]
+                    del self._chunk_expected[msg_id]
+                    self._apply_b64_event(ordered)
+
+    def _apply_b64_event(self, b64_payload: str) -> None:
+        try:
+            raw = base64.urlsafe_b64decode(b64_payload.encode("ascii"))
+            event = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return
+        self._apply_event(event)
+
+    def _apply_event(self, event: dict) -> None:
+        event_type = event.get("type")
+        with self._lock:
+            if event_type == "task_create":
+                t = event["task"]
+                self._tasks[t["id"]] = Task(**t)
+                return
+
+            if event_type == "task_claim":
+                task = self._tasks.get(event["task_id"])
+                if task and task.status == "pending":
+                    task.status = "processing"
+                    task.claimed_by = event["agent_id"]
+                    task.updated_at = event.get("updated_at", time.time())
+                return
+
+            if event_type == "task_complete":
+                task = self._tasks.get(event["task_id"])
+                if task:
+                    task.status = "done"
+                    task.result = event.get("result")
+                    task.updated_at = event.get("updated_at", time.time())
+                return
+
+            if event_type == "task_fail":
+                task = self._tasks.get(event["task_id"])
+                if task:
+                    retries = task.retries + 1
+                    task.retries = retries
+                    task.error = event.get("error")
+                    task.updated_at = event.get("updated_at", time.time())
+                    if retries <= task.max_retries:
+                        task.status = "pending"
+                        task.claimed_by = None
+                    else:
+                        task.status = "failed"
+                return
+
+            if event_type == "checkpoint_set":
+                cp = Checkpoint(
+                    agent_id=event["agent_id"],
+                    key=event["key"],
+                    value=event["value"],
+                    saved_at=event.get("saved_at", time.time()),
+                )
+                self._checkpoints[(cp.agent_id, cp.key)] = cp
+                return
+
+            if event_type == "message_publish":
+                self._messages.append(
+                    BusMessage(
+                        id=event["id"],
+                        topic=event["topic"],
+                        payload=event["payload"],
+                        published_at=event.get("published_at", time.time()),
+                        publisher=event["publisher"],
+                    )
+                )
 
     def _requeue_stale_tasks(self, queue: str) -> int:
-        """
-        Find tasks stuck in 'processing' for too long (agent crashed)
-        and reset them to 'pending' so another agent can pick them up.
-        """
         stale_cutoff = time.time() - self.STALE_TASK_TIMEOUT
-        with self._tx() as conn:
-            result = conn.execute(
-                """
-                UPDATE tasks SET status='pending', claimed_by=NULL, updated_at=?
-                WHERE queue=? AND status='processing' AND updated_at < ?
-                """,
-                (time.time(), queue, stale_cutoff),
-            )
-            return result.rowcount
+        changed = 0
+        with self._lock:
+            for task in self._tasks.values():
+                if task.queue != queue:
+                    continue
+                if task.status == "processing" and task.updated_at < stale_cutoff:
+                    task.status = "pending"
+                    task.claimed_by = None
+                    task.updated_at = time.time()
+                    changed += 1
+        return changed
 
-    def _row_to_task(self, row) -> Task:
-        return Task(
-            id=row["id"],
-            queue=row["queue"],
-            payload=json.loads(row["payload"]),
-            status=row["status"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-            claimed_by=row["claimed_by"],
-            result=json.loads(row["result"]) if row["result"] else None,
-            error=row["error"],
-            retries=row["retries"],
-            max_retries=row["max_retries"],
-            parent_task_id=row["parent_task_id"],
-        )
+    def _wait_until(self, predicate, timeout: float) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.05)
+        return False
+
+    def _is_claimed_by(self, task_id: str, agent_id: str) -> bool:
+        task = self._tasks.get(task_id)
+        return bool(task and task.status == "processing" and task.claimed_by == agent_id)
+
+    def _is_not_pending(self, task_id: str) -> bool:
+        task = self._tasks.get(task_id)
+        return bool(task and task.status != "pending")
+
+    def _task_status(self, task_id: str) -> str | None:
+        task = self._tasks.get(task_id)
+        return task.status if task else None
