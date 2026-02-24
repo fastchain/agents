@@ -7,11 +7,12 @@ import os
 from bus import DurableBus
 from mcp.server.fastmcp import FastMCP
 
-IRC_HOST = os.environ.get("BUS_IRC_HOST", "localhost")
-IRC_PORT = int(os.environ.get("BUS_IRC_PORT", "6667"))
+MM_URL = os.environ.get("MM_URL", "http://localhost:8065")
+MM_TOKEN = os.environ.get("MM_TOKEN", "")
+MM_TEAM = os.environ.get("MM_TEAM", "agents")
 
 mcp = FastMCP("Bus Dashboard")
-bus = DurableBus(irc_host=IRC_HOST, irc_port=IRC_PORT)
+bus = DurableBus(mm_url=MM_URL, mm_token=MM_TOKEN, mm_team=MM_TEAM)
 
 
 @mcp.tool()

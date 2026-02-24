@@ -2,11 +2,11 @@
 mcp/orchestrator/bus_dashboard_server.py — MCP server exposing bus state & control
 
 An MCP (Model Context Protocol) server that gives LLM-based tools read/write
-access to the DurableBus SQLite database. Useful for building dashboards,
-debugging agent state, or letting an orchestrator LLM inspect the bus directly.
+access to the DurableBus. Useful for building dashboards, debugging agent
+state, or letting an orchestrator LLM inspect the bus directly.
 
 Run:
-    BUS_DB_PATH=agent_bus.db python mcp/orchestrator/bus_dashboard_server.py
+    MM_URL=http://localhost:8065 MM_TOKEN=<token> python mcp/orchestrator/bus_dashboard_server.py
 
 Tools exposed:
     - bus_status       → Queue overview (pending/processing/done/failed counts)
@@ -19,7 +19,6 @@ Tools exposed:
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 
@@ -31,10 +30,12 @@ from mcp.server.fastmcp import FastMCP
 
 # ── Server setup ───────────────────────────────────────────────────────────
 
-DB_PATH = os.environ.get("BUS_DB_PATH", "agent_bus.db")
+MM_URL = os.environ.get("MM_URL", "http://localhost:8065")
+MM_TOKEN = os.environ.get("MM_TOKEN", "")
+MM_TEAM = os.environ.get("MM_TEAM", "agents")
 
 mcp = FastMCP("Bus Dashboard")
-bus = DurableBus(DB_PATH)
+bus = DurableBus(mm_url=MM_URL, mm_token=MM_TOKEN, mm_team=MM_TEAM)
 
 
 # ── Tools ──────────────────────────────────────────────────────────────────
@@ -89,32 +90,18 @@ def list_tasks(queue: str | None = None, status: str | None = None, limit: int =
 
     Returns a list of task summaries.
     """
-    conn = bus._conn
-    query = "SELECT * FROM tasks WHERE 1=1"
-    params: list = []
-
-    if queue is not None:
-        query += " AND queue = ?"
-        params.append(queue)
-    if status is not None:
-        query += " AND status = ?"
-        params.append(status)
-
-    query += " ORDER BY created_at DESC LIMIT ?"
-    params.append(limit)
-
-    rows = conn.execute(query, params).fetchall()
-    results = []
-    for row in rows:
-        results.append({
-            "id": row["id"],
-            "queue": row["queue"],
-            "status": row["status"],
-            "created_at": row["created_at"],
-            "payload_preview": json.loads(row["payload"]).get("task", "")[:100],
-            "error": row["error"],
-        })
-    return results
+    rows = bus.list_tasks(queue=queue, status=status, limit=limit)
+    return [
+        {
+            "id": t.id,
+            "queue": t.queue,
+            "status": t.status,
+            "created_at": t.created_at,
+            "payload_preview": str(t.payload.get("task", ""))[:100],
+            "error": t.error,
+        }
+        for t in rows
+    ]
 
 
 @mcp.tool()
@@ -126,23 +113,13 @@ def list_checkpoints(agent_id: str | None = None) -> list[dict]:
 
     Returns a list of checkpoint records.
     """
-    conn = bus._conn
-    if agent_id is not None:
-        rows = conn.execute(
-            "SELECT * FROM checkpoints WHERE agent_id = ? ORDER BY saved_at DESC",
-            (agent_id,),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM checkpoints ORDER BY agent_id, saved_at DESC"
-        ).fetchall()
-
+    rows = bus.list_checkpoints(agent_id=agent_id)
     return [
         {
-            "agent_id": row["agent_id"],
-            "key": row["key"],
-            "value": json.loads(row["value"]),
-            "saved_at": row["saved_at"],
+            "agent_id": row.agent_id,
+            "key": row.key,
+            "value": row.value,
+            "saved_at": row.saved_at,
         }
         for row in rows
     ]

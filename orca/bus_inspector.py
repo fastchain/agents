@@ -1,9 +1,10 @@
 """
-bus_inspector.py — inspect IRC bus state
+bus_inspector.py — inspect Mattermost bus state
 """
 
 import argparse
 import json
+import os
 
 from rich.console import Console
 from rich.table import Table
@@ -16,7 +17,7 @@ console = Console()
 def cmd_status(bus: DurableBus, _args):
     report = bus.status_report()
     if not report:
-        console.print("[dim]No tasks observed yet on this IRC bus connection.[/dim]")
+        console.print("[dim]No tasks observed yet on this Mattermost bus connection.[/dim]")
         return
 
     table = Table(title="Bus Status", show_header=True)
@@ -109,10 +110,23 @@ def cmd_checkpoints(bus: DurableBus, args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Inspect IRC bus state")
-    parser.add_argument("--db", default="agent_bus.db", help="Ignored (backward compatible)")
-    parser.add_argument("--irc-host", default="localhost", help="IRC server host")
-    parser.add_argument("--irc-port", type=int, default=6667, help="IRC server port")
+    parser = argparse.ArgumentParser(description="Inspect Mattermost bus state")
+    parser.add_argument("--db", default=None, help="Ignored (backward compatible)")
+    parser.add_argument(
+        "--mm-url",
+        default=os.environ.get("MM_URL", "http://localhost:8065"),
+        help="Mattermost server URL (env: MM_URL)",
+    )
+    parser.add_argument(
+        "--mm-token",
+        default=os.environ.get("MM_TOKEN", ""),
+        help="Mattermost bot/personal-access token (env: MM_TOKEN)",
+    )
+    parser.add_argument(
+        "--mm-team",
+        default=os.environ.get("MM_TEAM", "agents"),
+        help="Mattermost team name (env: MM_TEAM)",
+    )
 
     sub = parser.add_subparsers(dest="command")
 
@@ -129,7 +143,7 @@ def main():
     p_ckpt.add_argument("--agent", help="Filter by agent ID")
 
     args = parser.parse_args()
-    bus = DurableBus(args.db, irc_host=args.irc_host, irc_port=args.irc_port)
+    bus = DurableBus(mm_url=args.mm_url, mm_token=args.mm_token, mm_team=args.mm_team)
 
     if args.command == "tasks":
         cmd_tasks(bus, args)

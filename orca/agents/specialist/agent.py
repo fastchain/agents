@@ -5,6 +5,7 @@ agents/specialist/agent.py — Resumable Specialist Agent
 """
 
 import argparse
+import os
 import time
 import uuid
 from pathlib import Path
@@ -145,13 +146,26 @@ def main():
     parser.add_argument("--queue", required=True, help="Bus queue to listen on")
     parser.add_argument("--manual", required=True, help="Path to the manual .md file")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="LiteLLM model string")
-    parser.add_argument("--db", default="agent_bus.db", help="Ignored (backward compatible)")
-    parser.add_argument("--irc-host", default="localhost", help="IRC server host")
-    parser.add_argument("--irc-port", type=int, default=6667, help="IRC server port")
+    parser.add_argument("--db", default=None, help="Ignored (backward compatible)")
+    parser.add_argument(
+        "--mm-url",
+        default=os.environ.get("MM_URL", "http://localhost:8065"),
+        help="Mattermost server URL (env: MM_URL)",
+    )
+    parser.add_argument(
+        "--mm-token",
+        default=os.environ.get("MM_TOKEN", ""),
+        help="Mattermost bot/personal-access token (env: MM_TOKEN)",
+    )
+    parser.add_argument(
+        "--mm-team",
+        default=os.environ.get("MM_TEAM", "agents"),
+        help="Mattermost team name (env: MM_TEAM)",
+    )
     parser.add_argument("--agent-id", default=None, help="Agent instance ID (auto-generated if not set)")
     args = parser.parse_args()
 
-    bus = DurableBus(args.db, irc_host=args.irc_host, irc_port=args.irc_port)
+    bus = DurableBus(mm_url=args.mm_url, mm_token=args.mm_token, mm_team=args.mm_team)
     specialist = SpecialistAgent(
         bus=bus,
         queue=args.queue,

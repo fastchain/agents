@@ -1,8 +1,17 @@
 # run_orchestrator.py
+#
+# Set MM_URL, MM_TOKEN, and MM_TEAM environment variables before running,
+# or pass them as constructor kwargs below.
+import os
+
 from bus import DurableBus
 from agents.orchestrator import ResumableOrchestrator
 
-bus = DurableBus(irc_host="localhost", irc_port=6667)
+bus = DurableBus(
+    mm_url=os.environ.get("MM_URL", "http://localhost:8065"),
+    mm_token=os.environ.get("MM_TOKEN", ""),
+    mm_team=os.environ.get("MM_TEAM", "agents"),
+)
 orch = ResumableOrchestrator(bus=bus, agent_id="demo-orchestrator")
 orch.register_specialist(
     tool_name="ask_demo_specialist",

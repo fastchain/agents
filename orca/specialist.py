@@ -15,12 +15,13 @@ fresh LLM call with the full manual in the system prompt.
 The BUS is the source of truth for which tasks exist and their results.
 
 Run a specialist:
-    python specialist.py --queue db_specialist --manual manuals/postgres.md
+    MM_TOKEN=<token> python specialist.py --queue db_specialist --manual manuals/postgres.md
 
 Multiple specialists can run in parallel for the same queue (they compete
-to claim tasks — only one wins each task due to atomic DB update).
+to claim tasks — only one wins each task, settled by Mattermost message order).
 """
 
+import os
 import time
 import uuid
 import argparse
@@ -190,11 +191,26 @@ def main():
     parser.add_argument("--queue",   required=True, help="Bus queue to listen on")
     parser.add_argument("--manual",  required=True, help="Path to the manual .md file")
     parser.add_argument("--model",   default=DEFAULT_MODEL, help="LiteLLM model string")
-    parser.add_argument("--db",      default="agent_bus.db", help="SQLite bus database path")
+    parser.add_argument("--db",      default=None, help="Ignored (backward compatible)")
+    parser.add_argument(
+        "--mm-url",
+        default=os.environ.get("MM_URL", "http://localhost:8065"),
+        help="Mattermost server URL (env: MM_URL)",
+    )
+    parser.add_argument(
+        "--mm-token",
+        default=os.environ.get("MM_TOKEN", ""),
+        help="Mattermost bot/personal-access token (env: MM_TOKEN)",
+    )
+    parser.add_argument(
+        "--mm-team",
+        default=os.environ.get("MM_TEAM", "agents"),
+        help="Mattermost team name (env: MM_TEAM)",
+    )
     parser.add_argument("--agent-id", default=None, help="Agent instance ID (auto-generated if not set)")
     args = parser.parse_args()
 
-    bus = DurableBus(args.db)
+    bus = DurableBus(mm_url=args.mm_url, mm_token=args.mm_token, mm_team=args.mm_team)
     specialist = SpecialistAgent(
         bus=bus,
         queue=args.queue,

@@ -1,20 +1,33 @@
 from __future__ import annotations
 
 """
-IRC-backed bus.
+Mattermost-backed bus.
 
-Queues are IRC channels on a server (default localhost:6667). Task state and
-checkpoints are synchronized by broadcasting structured events over IRC.
+Queues are Mattermost channels on a team (default: team "agents" on
+http://localhost:8065). Task state and checkpoints are synchronized by
+posting structured events to channels via the Mattermost REST API.
+
+A WebSocket listener receives all posted events (Mattermost echoes the
+poster's own messages), enabling the same wait-until-applied pattern that
+the previous IRC-backed implementation used.
+
+Environment variables (all optional, override constructor defaults):
+  MM_URL   – Mattermost server URL          (default: http://localhost:8065)
+  MM_TOKEN – Bot / personal-access token    (required)
+  MM_TEAM  – Team name to use               (default: agents)
 """
 
 import base64
 import json
-import socket
+import os
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
+
+import requests
+import websocket  # websocket-client package
 
 
 @dataclass
@@ -52,36 +65,46 @@ class BusMessage:
 
 class DurableBus:
     """
-    IRC-backed bus preserving the previous DurableBus API shape.
+    Mattermost-backed bus preserving the previous DurableBus API shape.
 
     Notes:
     - `db_path` is accepted for backwards compatibility but ignored.
-    - Queue names map to IRC channels.
-    - Uses event synchronization over IRC PRIVMSG.
+    - Queue names map to Mattermost channels (prefix: q_).
+    - Uses event synchronization over Mattermost posts.
+    - Mattermost WebSocket echoes the poster's own messages, enabling
+      the same wait-until-applied pattern as the IRC implementation.
     """
 
     STALE_TASK_TIMEOUT = 120
-    CONTROL_CHANNEL = "#bus_control"
-    CHECKPOINT_CHANNEL = "#bus_checkpoints"
-    MESSAGE_CHANNEL = "#bus_messages"
+    CONTROL_CHANNEL = "bus_control"
+    CHECKPOINT_CHANNEL = "bus_checkpoints"
+    MESSAGE_CHANNEL = "bus_messages"
+
+    # Mattermost posts allow up to ~16 383 chars; stay well under that.
+    CHUNK_SIZE = 13_000
 
     def __init__(
         self,
         db_path: str | None = None,
         *,
-        irc_host: str = "localhost",
-        irc_port: int = 6667,
-        nickname: str | None = None,
+        mm_url: str = "http://localhost:8065",
+        mm_token: str = "",
+        mm_team: str = "agents",
     ):
         _ = db_path
-        self.irc_host = irc_host
-        self.irc_port = irc_port
-        self.nickname = nickname or f"bus_{uuid.uuid4().hex[:8]}"
+        self.mm_url = (os.environ.get("MM_URL") or mm_url).rstrip("/")
+        self.mm_token = os.environ.get("MM_TOKEN") or mm_token
+        self.mm_team = os.environ.get("MM_TEAM") or mm_team
+
+        self._headers = {
+            "Authorization": f"Bearer {self.mm_token}",
+            "Content-Type": "application/json",
+        }
 
         self._tasks: dict[str, Task] = {}
         self._checkpoints: dict[tuple[str, str], Checkpoint] = {}
         self._messages: list[BusMessage] = []
-        self._joined_channels: set[str] = set()
+        self._channel_ids: dict[str, str] = {}  # channel_name → channel_id
         self._chunk_buffer: dict[str, dict[int, str]] = {}
         self._chunk_expected: dict[str, int] = {}
 
@@ -90,26 +113,23 @@ class DurableBus:
         self._ready = threading.Event()
         self._stop = threading.Event()
 
-        self._sock = socket.create_connection((self.irc_host, self.irc_port), timeout=10)
-        self._sock.settimeout(0.5)
-        self._recv_buffer = b""
+        # Resolve team and bot identity via REST.
+        self._team_id = self._get_or_create_team(self.mm_team)
+        self._bot_user_id = self._get_bot_user_id()
 
-        self._send_raw(f"NICK {self.nickname}")
-        self._send_raw(f"USER {self.nickname} 0 * :{self.nickname}")
-
-        self._reader = threading.Thread(target=self._reader_loop, daemon=True)
+        # Start WebSocket listener before joining channels so we don't miss events.
+        self._reader = threading.Thread(target=self._ws_reader_loop, daemon=True)
         self._reader.start()
+        self._ready.wait(timeout=10.0)
 
-        # Give connection a short window to register and start reading.
-        self._ready.wait(timeout=2.0)
-
+        # Join / create the three persistent control channels.
         self._ensure_channel(self.CONTROL_CHANNEL)
         self._ensure_channel(self.CHECKPOINT_CHANNEL)
         self._ensure_channel(self.MESSAGE_CHANNEL)
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Public API
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def publish_task(
         self,
@@ -140,7 +160,7 @@ class DurableBus:
             },
         }
         self._send_event(self._queue_channel(queue), event)
-        self._wait_until(lambda: tid in self._tasks, timeout=2.0)
+        self._wait_until(lambda: tid in self._tasks, timeout=5.0)
         return tid
 
     def claim_task(self, queue: str, agent_id: str) -> Task | None:
@@ -164,7 +184,7 @@ class DurableBus:
 
             self._wait_until(
                 lambda: self._is_claimed_by(task.id, agent_id) or self._is_not_pending(task.id),
-                timeout=1.0,
+                timeout=2.0,
             )
 
             claimed = self.get_task(task.id)
@@ -184,7 +204,7 @@ class DurableBus:
             "updated_at": time.time(),
         }
         self._send_event(self._queue_channel(task.queue), event)
-        self._wait_until(lambda: self._task_status(task_id) == "done", timeout=2.0)
+        self._wait_until(lambda: self._task_status(task_id) == "done", timeout=5.0)
 
     def fail_task(self, task_id: str, error: str) -> None:
         task = self.get_task(task_id)
@@ -231,7 +251,7 @@ class DurableBus:
             "saved_at": time.time(),
         }
         self._send_event(self.CHECKPOINT_CHANNEL, event)
-        self._wait_until(lambda: (agent_id, key) in self._checkpoints, timeout=2.0)
+        self._wait_until(lambda: (agent_id, key) in self._checkpoints, timeout=5.0)
 
     def load_checkpoint(self, agent_id: str, key: str, default: Any = None) -> Any:
         with self._lock:
@@ -302,85 +322,180 @@ class DurableBus:
         cps.sort(key=lambda cp: cp.saved_at, reverse=True)
         return [Checkpoint(**cp.__dict__) for cp in cps]
 
-    # ---------------------------------------------------------------------
-    # Internal helpers
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Mattermost REST helpers
+    # ------------------------------------------------------------------
+
+    def _get_or_create_team(self, team_name: str) -> str:
+        resp = requests.get(
+            f"{self.mm_url}/api/v4/teams/name/{team_name}",
+            headers=self._headers,
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return resp.json()["id"]
+        # Create the team if it does not exist yet.
+        resp = requests.post(
+            f"{self.mm_url}/api/v4/teams",
+            headers=self._headers,
+            json={"name": team_name, "display_name": team_name.replace("_", " ").title(), "type": "O"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()["id"]
+
+    def _get_bot_user_id(self) -> str:
+        resp = requests.get(
+            f"{self.mm_url}/api/v4/users/me",
+            headers=self._headers,
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()["id"]
+
+    def _ensure_channel(self, channel_name: str) -> str:
+        """Return the Mattermost channel_id for *channel_name*, creating it if needed."""
+        with self._lock:
+            if channel_name in self._channel_ids:
+                return self._channel_ids[channel_name]
+
+        resp = requests.get(
+            f"{self.mm_url}/api/v4/teams/{self._team_id}/channels/name/{channel_name}",
+            headers=self._headers,
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            channel_id = resp.json()["id"]
+        else:
+            display = channel_name.replace("_", " ").replace("-", " ").title()
+            resp = requests.post(
+                f"{self.mm_url}/api/v4/channels",
+                headers=self._headers,
+                json={
+                    "team_id": self._team_id,
+                    "name": channel_name,
+                    "display_name": display,
+                    "type": "O",  # Open / public channel
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            channel_id = resp.json()["id"]
+
+        # Make sure the bot is a member so it receives WebSocket events.
+        requests.post(
+            f"{self.mm_url}/api/v4/channels/{channel_id}/members",
+            headers=self._headers,
+            json={"user_id": self._bot_user_id},
+            timeout=10,
+        )
+
+        with self._lock:
+            self._channel_ids[channel_name] = channel_id
+        return channel_id
 
     def _queue_channel(self, queue: str) -> str:
-        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in queue)
-        if not safe:
-            safe = "default"
-        channel = f"#q_{safe}"
-        self._ensure_channel(channel)
-        return channel
+        """Map a logical queue name to a sanitised Mattermost channel name."""
+        safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in queue.lower())
+        safe = safe.strip("_-") or "default"
+        # Mattermost channel names: max 64 chars, must start with alphanumeric.
+        channel_name = f"q_{safe}"[:64]
+        self._ensure_channel(channel_name)
+        return channel_name
 
-    def _ensure_channel(self, channel: str) -> None:
-        with self._lock:
-            if channel in self._joined_channels:
-                return
-            self._joined_channels.add(channel)
-        self._send_raw(f"JOIN {channel}")
+    # ------------------------------------------------------------------
+    # Event transmission
+    # ------------------------------------------------------------------
 
-    def _send_event(self, channel: str, event: dict) -> None:
-        self._ensure_channel(channel)
+    def _send_event(self, channel_name: str, event: dict) -> None:
+        channel_id = self._ensure_channel(channel_name)
         payload = json.dumps(event, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
         b64 = base64.urlsafe_b64encode(payload).decode("ascii")
 
-        # Keep margin under IRC line length limits.
-        chunk_size = 300
-        if len(b64) <= chunk_size:
-            self._send_raw(f"PRIVMSG {channel} :BUS1 {b64}")
+        if len(b64) <= self.CHUNK_SIZE:
+            self._post_message(channel_id, f"BUS1 {b64}")
             return
 
         msg_id = uuid.uuid4().hex[:10]
-        total = (len(b64) + chunk_size - 1) // chunk_size
+        total = (len(b64) + self.CHUNK_SIZE - 1) // self.CHUNK_SIZE
         for idx in range(total):
-            start = idx * chunk_size
-            end = start + chunk_size
-            piece = b64[start:end]
-            self._send_raw(f"PRIVMSG {channel} :BUSC {msg_id} {idx + 1}/{total} {piece}")
+            start = idx * self.CHUNK_SIZE
+            piece = b64[start : start + self.CHUNK_SIZE]
+            self._post_message(channel_id, f"BUSC {msg_id} {idx + 1}/{total} {piece}")
 
-    def _send_raw(self, line: str) -> None:
-        data = (line + "\r\n").encode("utf-8", errors="ignore")
+    def _post_message(self, channel_id: str, text: str) -> None:
         with self._send_lock:
-            self._sock.sendall(data)
+            requests.post(
+                f"{self.mm_url}/api/v4/posts",
+                headers=self._headers,
+                json={"channel_id": channel_id, "message": text},
+                timeout=10,
+            )
 
-    def _reader_loop(self) -> None:
-        self._ready.set()
+    # ------------------------------------------------------------------
+    # WebSocket listener
+    # ------------------------------------------------------------------
+
+    def _ws_reader_loop(self) -> None:
+        ws_url = (
+            self.mm_url.replace("https://", "wss://").replace("http://", "ws://")
+            + "/api/v4/websocket"
+        )
+
         while not self._stop.is_set():
             try:
-                chunk = self._sock.recv(4096)
-                if not chunk:
-                    time.sleep(0.1)
-                    continue
-                self._recv_buffer += chunk
+                ws = websocket.create_connection(ws_url, timeout=1)
+                # Authenticate with the bot token.
+                ws.send(json.dumps({
+                    "seq": 1,
+                    "action": "authentication_challenge",
+                    "data": {"token": self.mm_token},
+                }))
+                self._ready.set()
 
-                while b"\r\n" in self._recv_buffer:
-                    line, self._recv_buffer = self._recv_buffer.split(b"\r\n", 1)
-                    self._handle_line(line.decode("utf-8", errors="ignore"))
-            except socket.timeout:
-                continue
+                while not self._stop.is_set():
+                    try:
+                        raw = ws.recv()
+                        if raw:
+                            self._handle_ws_event(raw)
+                    except websocket.WebSocketTimeoutException:
+                        continue
+                    except Exception:
+                        break
+
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+
             except Exception:
-                time.sleep(0.1)
+                time.sleep(2)
 
-    def _handle_line(self, line: str) -> None:
-        if line.startswith("PING"):
-            token = line.split(":", 1)[1] if ":" in line else ""
-            self._send_raw(f"PONG :{token}")
+    def _handle_ws_event(self, raw: str) -> None:
+        try:
+            event = json.loads(raw)
+        except Exception:
             return
 
-        if " PRIVMSG " not in line:
+        if event.get("event") != "posted":
+            return
+
+        data = event.get("data", {})
+        post_str = data.get("post")
+        if not post_str:
             return
 
         try:
-            prefix, rest = line.split(" PRIVMSG ", 1)
-            channel, text = rest.split(" :", 1)
-        except ValueError:
+            post = json.loads(post_str)
+        except Exception:
             return
 
+        text = post.get("message", "")
+        self._handle_message(text)
+
+    def _handle_message(self, text: str) -> None:
         if text.startswith("BUS1 "):
-            b64 = text[5:].strip()
-            self._apply_b64_event(b64)
+            self._apply_b64_event(text[5:].strip())
             return
 
         if text.startswith("BUSC "):
@@ -392,8 +507,7 @@ class DurableBus:
                 return
             idx_str, total_str = seq.split("/", 1)
             try:
-                idx = int(idx_str)
-                total = int(total_str)
+                idx, total = int(idx_str), int(total_str)
             except ValueError:
                 return
 
@@ -404,7 +518,9 @@ class DurableBus:
                 self._chunk_buffer[msg_id][idx] = piece
 
                 if len(self._chunk_buffer[msg_id]) == self._chunk_expected[msg_id]:
-                    ordered = "".join(self._chunk_buffer[msg_id][i] for i in range(1, total + 1))
+                    ordered = "".join(
+                        self._chunk_buffer[msg_id][i] for i in range(1, total + 1)
+                    )
                     del self._chunk_buffer[msg_id]
                     del self._chunk_expected[msg_id]
                     self._apply_b64_event(ordered)
@@ -475,6 +591,10 @@ class DurableBus:
                         publisher=event["publisher"],
                     )
                 )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _requeue_stale_tasks(self, queue: str) -> int:
         stale_cutoff = time.time() - self.STALE_TASK_TIMEOUT

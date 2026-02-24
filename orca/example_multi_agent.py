@@ -10,13 +10,14 @@ Run this to simulate:
   4. Specialist finishes, orchestrator gets result
 
 To run:
-    python example_multi_agent.py
+    MM_URL=http://localhost:8065 MM_TOKEN=<token> python example_multi_agent.py
 
 To simulate crash + resume:
     python example_multi_agent.py --crash      # stops after first delegation
     python example_multi_agent.py --resume     # resumes the same session
 """
 
+import os
 import sys
 import time
 import threading
@@ -33,8 +34,9 @@ console = Console()
 
 # Fixed session ID so we can resume the same session across runs
 SESSION_ID = "demo-session-001"
-IRC_HOST = "localhost"
-IRC_PORT = 6667
+MM_URL = os.environ.get("MM_URL", "http://localhost:8065")
+MM_TOKEN = os.environ.get("MM_TOKEN", "")
+MM_TEAM = os.environ.get("MM_TEAM", "agents")
 
 
 def create_demo_manual():
@@ -95,7 +97,7 @@ def main():
     parser.add_argument("--resume", action="store_true", help="Resume a crashed session")
     args = parser.parse_args()
 
-    bus = DurableBus(irc_host=IRC_HOST, irc_port=IRC_PORT)
+    bus = DurableBus(mm_url=MM_URL, mm_token=MM_TOKEN, mm_team=MM_TEAM)
     manual_path = create_demo_manual()
 
     # ── Show current bus state ─────────────────────────────────────────────
@@ -138,7 +140,7 @@ def main():
     for key in checkpoints:
         console.print(f"  [dim]•[/dim] {key}")
 
-    console.print(f"\n[green]Done. IRC bus server: {IRC_HOST}:{IRC_PORT}[/green]")
+    console.print(f"\n[green]Done. Mattermost bus: {MM_URL} (team: {MM_TEAM})[/green]")
     console.print("[dim]Run again with same session_id to resume if checkpoints are still available in bus state.[/dim]")
 
 
